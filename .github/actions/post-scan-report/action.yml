@@ -1,0 +1,454 @@
+name: "Post Security Scan Results"
+description: "Posts security scan results as a PR comment, creating or updating an existing comment"
+
+inputs:
+  NPM_OUTCOME:
+    required: true
+    description: "Outcome of the npm vulnerability scan (success/failure/skipped)"
+  COMPOSER_OUTCOME:
+    required: true
+    description: "Outcome of the Composer vulnerability scan (success/failure/skipped)"
+  SEMGREP_OUTCOME:
+    required: true
+    description: "Outcome of the Semgrep SAST scan (success/failure/skipped)"
+  SUPERVISORD:
+    required: false
+    default: "false"
+    description: "Whether the project uses a supervisord container (includes the supervisord Trivy row when true)"
+  REF:
+    required: true
+    description: "The branch/ref name used in the comment marker for deduplication"
+  GITHUB_TOKEN:
+    required: true
+    description: "GitHub token for posting PR comments (requires pull-requests: write)"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Compute ref slug
+      id: ref-slug
+      shell: bash
+      env:
+        REF: ${{ inputs.REF }}
+      run: echo "slug=$(echo "$REF" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+    - name: Download scan results
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: scan-results-${{ steps.ref-slug.outputs.slug }}
+        path: ./scan-results
+      continue-on-error: true
+
+    - name: Download Trivy results (init)
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: trivy-results-init-${{ steps.ref-slug.outputs.slug }}
+        path: ./trivy-results-init
+      continue-on-error: true
+
+    - name: Download Trivy results (php)
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: trivy-results-php-${{ steps.ref-slug.outputs.slug }}
+        path: ./trivy-results-php
+      continue-on-error: true
+
+    - name: Download Trivy results (supervisord)
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: trivy-results-supervisord-${{ steps.ref-slug.outputs.slug }}
+        path: ./trivy-results-supervisord
+      continue-on-error: true
+
+    - name: Post security scan results to PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.GITHUB_TOKEN }}
+      run: |
+        npm_outcome="${{ inputs.NPM_OUTCOME }}"
+        composer_outcome="${{ inputs.COMPOSER_OUTCOME }}"
+        semgrep_outcome="${{ inputs.SEMGREP_OUTCOME }}"
+        php_outcome=$(cat ./trivy-results-php/trivy-php-status.txt 2>/dev/null || echo "unknown")
+        supervisord_outcome=$(cat ./trivy-results-supervisord/trivy-supervisord-status.txt 2>/dev/null || echo "unknown")
+
+        status_icon() {
+          case "$1" in
+            success) echo "✅ Passed" ;;
+            failure) echo "❌ Failed" ;;
+            skipped) echo "❌ Skipped" ;;
+            *) echo "⚠️ Unknown" ;;
+          esac
+        }
+
+        init_outcome=$(cat ./trivy-results-init/trivy-init-status.txt 2>/dev/null || echo "unknown")
+
+        if [[ "${{ inputs.SUPERVISORD }}" == "true" ]]; then
+          labels=("npm audit" "Composer audit" "Semgrep SAST" "Trivy (init image)" "Trivy (php image)" "Trivy (supervisord image)")
+          outcomes=("$npm_outcome" "$composer_outcome" "$semgrep_outcome" "$init_outcome" "$php_outcome" "$supervisord_outcome")
+        else
+          labels=("npm audit" "Composer audit" "Semgrep SAST" "Trivy (init image)" "Trivy (php image)")
+          outcomes=("$npm_outcome" "$composer_outcome" "$semgrep_outcome" "$init_outcome" "$php_outcome")
+        fi
+
+        failure_count=0
+        for i in "${!outcomes[@]}"; do
+          if [ "${outcomes[$i]}" = "failure" ] || [ "${outcomes[$i]}" = "skipped" ]; then
+            failure_count=$((failure_count + 1))
+          fi
+        done
+
+        LOGS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+        {
+          echo "<!-- vulnerability-scan-results-${{ inputs.REF }} -->"
+          echo "## Security Scan Results for ${{ inputs.REF }}"
+          echo ""
+
+          if [ "$failure_count" -gt 0 ]; then
+            echo "> [!CAUTION]"
+            echo "> **$failure_count scan(s) failed** — action required. See below for what to fix."
+          else
+            echo "> [!TIP]"
+            echo "> All scans passed — no immediate action required."
+          fi
+          echo ""
+
+          echo "| Scan | Status |"
+          echo "|------|--------|"
+          for i in "${!labels[@]}"; do
+            echo "| ${labels[$i]} | $(status_icon "${outcomes[$i]}") |"
+          done
+
+          # Abandoned Composer packages don't fail the build (composer-scan runs
+          # `--abandoned=report`), so surface them here unconditionally rather
+          # than nesting under the failure_count block below.
+          if [ -f "./scan-results/composer-audit.json" ]; then
+            abandoned_rows=$(jq -r '.abandoned // {} | to_entries[] | [.key, (.value // "-")] | @tsv' ./scan-results/composer-audit.json 2>/dev/null || echo "")
+            if [ -n "$abandoned_rows" ]; then
+              abandoned_count=$(echo "$abandoned_rows" | wc -l)
+              echo ""
+              echo "> [!WARNING]"
+              echo "> **$abandoned_count Composer package(s) are abandoned**. These should be migrated when convenient."
+              echo ""
+              echo "| Package | Suggested Replacement |"
+              echo "|---------|------------------------|"
+              while IFS=$'\t' read -r pkg replacement; do
+                if [ "$replacement" = "-" ] || [ -z "$replacement" ]; then
+                  echo "| \`$pkg\` | _none suggested_ |"
+                else
+                  echo "| \`$pkg\` | \`$replacement\` |"
+                fi
+              done <<< "$abandoned_rows"
+            fi
+          fi
+
+          if [ "$failure_count" -gt 0 ]; then
+            echo ""
+            echo "---"
+            echo ""
+            echo "_Refer to the [action logs]($LOGS_URL) for full scan output._"
+
+            if [ "$npm_outcome" = "failure" ]; then
+              echo ""
+              echo "<details>"
+              echo "<summary><strong>npm audit</strong></summary>"
+              echo ""
+              found_any=false
+              for json_file in ./scan-results/npm-raw-*.json; do
+                [ -f "$json_file" ] || continue
+                scan_dir=$(jq -r '._scannedDir // "."' "$json_file" 2>/dev/null || echo ".")
+                dir_slug=$(echo "$scan_dir" | sed 's|^\./||;s|/|__|g')
+                pkgs_json=$(cat "./scan-results/npm-packages-${dir_slug:-root}.json" 2>/dev/null || echo '[]')
+                rows=$(jq -r --argjson pkgs "$pkgs_json" '
+                  def norm(v):
+                    (v // "" | ascii_downcase | ltrimstr("v")) as $s |
+                    ($s | [scan("[0-9]+")] | map(tonumber)) as $parts |
+                    ($parts + [0,0,0,0,0,0])[0:6];
+                  def vcmp(a; b):
+                    (norm(a)) as $a | (norm(b)) as $b |
+                    ([range(0;6)] | map($a[.] - $b[.]) | map(select(. != 0)) | first) // 0;
+                  def satisfies(cur; constraint):
+                    if (constraint == "") then true
+                    elif (constraint | startswith(">=")) then vcmp(cur; constraint[2:]) >= 0
+                    elif (constraint | startswith("<=")) then vcmp(cur; constraint[2:]) <= 0
+                    elif (constraint | startswith("!=")) then vcmp(cur; constraint[2:]) != 0
+                    elif (constraint | startswith("==")) then vcmp(cur; constraint[2:]) == 0
+                    elif (constraint | startswith(">")) then vcmp(cur; constraint[1:]) > 0
+                    elif (constraint | startswith("<")) then vcmp(cur; constraint[1:]) < 0
+                    else true
+                    end;
+                  # An inclusive "<=X" bound means X itself is still vulnerable, so
+                  # the real fix is the next version after X, not X verbatim.
+                  def bump_last(v):
+                    (v | [scan("[0-9]+")] | map(tonumber)) as $parts |
+                    if ($parts | length) == 0 then v
+                    else ($parts[:-1] + [$parts[-1] + 1] | map(tostring) | join(".")) end;
+                  def upper_bound(r):
+                    r | map(select(startswith("<"))) |
+                    map(if startswith("<=") then bump_last(.[2:]) else .[1:] end) | first;
+                  # npm ranges OR multiple disjoint windows with " || " and AND
+                  # constraints within a window with a space, e.g.
+                  # "<4.17.11 || >=4.17.20 <4.17.21" (a CVE reintroduced later)
+                  def npm_ranges(affected):
+                    (affected // "" | split("||") | map(
+                        gsub("^[ \t]+|[ \t]+$"; "") | split(" ") | map(select(. != ""))
+                      )
+                    );
+                  def fix_for(cur; affected):
+                    (npm_ranges(affected)) as $ranges |
+                    ($ranges | map(select(. as $r | $r | map(satisfies(cur; .)) | all))) as $matching |
+                    ($matching | map(upper_bound(.)) | map(select(. != null))) as $matchfixes |
+                    if ($matchfixes | length) > 0 then
+                      ($matchfixes | sort_by(norm(.)) | first)
+                    else
+                      ($ranges | map(upper_bound(.)) | map(select(. != null))) as $allfixes |
+                      if ($allfixes | length) > 0 then ($allfixes | sort_by(norm(.)) | last) else null end
+                    end;
+                  ($pkgs | map({(.name): .version}) | add // {}) as $versions |
+                  (.vulnerabilities // {}) | to_entries[] |
+                  select((.value.severity == "high" or .value.severity == "critical") and (.value.fixAvailable != false)) |
+                  ($versions[.key] // "unknown") as $current_ver |
+                  (.value.range // ([.value.via // [] | .[] | select(type == "object") | .range // ""] | map(select(. != "")) | join(" || "))) as $affected |
+                  [
+                    .key,
+                    (.value.severity | ascii_upcase),
+                    $current_ver,
+                    (if (.value.fixAvailable | type) == "object" then .value.fixAvailable.version
+                     else (fix_for($current_ver; $affected) // $affected // "-")
+                     end),
+                    (if (.value.fixAvailable | type) == "object" and .value.fixAvailable.isSemVerMajor then "force" else "auto" end),
+                    (([.value.via // [] | .[] | select(type == "object") | .url // ""] | map(select(. != "")) | first) // "-")
+                  ] |
+                  @tsv
+                ' "$json_file" 2>/dev/null || echo "")
+                [ -z "$rows" ] && continue
+                found_any=true
+                echo "**\`$scan_dir\`**"
+                echo ""
+                echo "| Package | Severity | Installed | Fix ≥ | Advisory | Command |"
+                echo "|---------|----------|-----------|-------|----------|---------|"
+                while IFS=$'\t' read -r pkg severity installed fix_ver fix_type advisory_url; do
+                  if [ "$fix_type" = "force" ]; then
+                    cmd="\`npm audit fix --force --prefix $scan_dir\` _(may introduce breaking changes)_"
+                  else
+                    cmd="\`npm audit fix --prefix $scan_dir\`"
+                  fi
+                  if [ "$advisory_url" != "-" ] && [ -n "$advisory_url" ]; then
+                    advisory_id=$(basename "$advisory_url")
+                    advisory_col="[$advisory_id]($advisory_url)"
+                  else
+                    advisory_col="-"
+                  fi
+                  echo "| \`$pkg\` | $severity | \`$installed\` | \`$fix_ver\` | $advisory_col | $cmd |"
+                done <<< "$rows"
+                echo ""
+              done
+              if [ "$found_any" = false ]; then
+                echo "Could not parse detailed results — refer to the [action logs]($LOGS_URL)."
+                echo ""
+              fi
+              echo "</details>"
+              echo ""
+            fi
+
+            if [ "$composer_outcome" = "failure" ]; then
+              echo ""
+              echo "<details>"
+              echo "<summary><strong>Composer audit</strong></summary>"
+              echo ""
+              install_exit_code=$(cat ./scan-results/composer-install-exit.txt 2>/dev/null || echo "0")
+              if [ "$install_exit_code" != "0" ]; then
+                echo "**\`composer install\` failed — see the install output below or the [action logs]($LOGS_URL) for details.**"
+                echo ""
+                echo "<details>"
+                echo "<summary>Install output</summary>"
+                echo ""
+                echo '```'
+                tail -c 4000 ./scan-results/composer-audit.txt 2>/dev/null || echo "(no output captured)"
+                echo '```'
+                echo ""
+                echo "</details>"
+                echo ""
+              elif [ -f "./scan-results/composer-audit.json" ] && jq empty ./scan-results/composer-audit.json 2>/dev/null; then
+                pkgs_json=$(cat "./scan-results/composer-packages.json" 2>/dev/null || echo '[]')
+                rows=$(jq -r --argjson pkgs "$pkgs_json" '
+                  def norm(v):
+                    (v // "" | ascii_downcase | ltrimstr("v")) as $s |
+                    ($s | [scan("[0-9]+")] | map(tonumber)) as $parts |
+                    ($parts + [0,0,0,0,0,0])[0:6];
+                  def vcmp(a; b):
+                    (norm(a)) as $a | (norm(b)) as $b |
+                    ([range(0;6)] | map($a[.] - $b[.]) | map(select(. != 0)) | first) // 0;
+                  def satisfies(cur; constraint):
+                    if (constraint == "") then true
+                    elif (constraint | startswith(">=")) then vcmp(cur; constraint[2:]) >= 0
+                    elif (constraint | startswith("<=")) then vcmp(cur; constraint[2:]) <= 0
+                    elif (constraint | startswith("!=")) then vcmp(cur; constraint[2:]) != 0
+                    elif (constraint | startswith("==")) then vcmp(cur; constraint[2:]) == 0
+                    elif (constraint | startswith(">")) then vcmp(cur; constraint[1:]) > 0
+                    elif (constraint | startswith("<")) then vcmp(cur; constraint[1:]) < 0
+                    else true
+                    end;
+                  # An inclusive "<=X" bound means X itself is still vulnerable, so
+                  # the real fix is the next version after X, not X verbatim.
+                  def bump_last(v):
+                    (v | [scan("[0-9]+")] | map(tonumber)) as $parts |
+                    if ($parts | length) == 0 then v
+                    else ($parts[:-1] + [$parts[-1] + 1] | map(tostring) | join(".")) end;
+                  def upper_bound(r):
+                    r | map(select(startswith("<"))) |
+                    map(if startswith("<=") then bump_last(.[2:]) else .[1:] end) | first;
+                  # Pick the upper bound of whichever disjoint range (affectedVersions is
+                  # "|"-separated, since a package can have separate vulnerable windows,
+                  # e.g. a CVE reintroduced in a later series) the installed version falls
+                  # into, so the displayed fix is always > installed. Falls back to the
+                  # highest upper bound across all ranges only when none match.
+                  def fix_for(cur; affected):
+                    (affected // "" | split("|") | map(split(",") | map(select(. != "")))) as $ranges |
+                    ($ranges | map(select(. as $r | $r | map(satisfies(cur; .)) | all))) as $matching |
+                    ($matching | map(upper_bound(.)) | map(select(. != null))) as $matchfixes |
+                    if ($matchfixes | length) > 0 then
+                      ($matchfixes | sort_by(norm(.)) | first)
+                    else
+                      ($ranges | map(upper_bound(.)) | map(select(. != null))) as $allfixes |
+                      if ($allfixes | length) > 0 then ($allfixes | sort_by(norm(.)) | last) else null end
+                    end;
+                  ($pkgs | map({(.name): .version}) | add // {}) as $versions |
+                  .advisories // {} | to_entries[] |
+                  .key as $pkg |
+                  ($versions[$pkg] // "unknown") as $current_ver |
+                  .value[] |
+                  select(.ignored != true and (.severity == "high" or .severity == "critical")) |
+                  [$pkg, (.severity | ascii_upcase), $current_ver,
+                   (fix_for($current_ver; .affectedVersions) // .affectedVersions // ""),
+                   (.advisoryId // "-"), (.link // "-"), (.cve // "-")] |
+                  @tsv
+                ' ./scan-results/composer-audit.json 2>/dev/null || echo "")
+                if [ -n "$rows" ]; then
+                  echo "| Package | Severity | Installed | Fix ≥ | Advisory | Command |"
+                  echo "|---------|----------|-----------|-------|----------|---------|"
+                  while IFS=$'\t' read -r pkg severity current_ver fix_ver advisory link cve; do
+                    if [ "$link" != "-" ] && [ -n "$link" ]; then
+                      advisory_col="[$advisory]($link)"
+                    else
+                      advisory_col="$advisory"
+                    fi
+                    if [ "$cve" != "-" ] && [ -n "$cve" ]; then
+                      advisory_col="$advisory_col / [$cve](https://nvd.nist.gov/vuln/detail/$cve)"
+                    fi
+                    echo "| \`$pkg\` | $severity | \`$current_ver\` | \`$fix_ver\` | $advisory_col | \`composer update $pkg\` |"
+                  done <<< "$rows"
+                  echo ""
+                else
+                  echo "No HIGH or CRITICAL advisories found — refer to the [action logs]($LOGS_URL) for lower-severity findings."
+                  echo ""
+                fi
+              else
+                echo "Could not parse detailed results — refer to the [action logs]($LOGS_URL)."
+                echo ""
+              fi
+              echo "</details>"
+              echo ""
+            fi
+
+            if [ "$semgrep_outcome" = "failure" ]; then
+              echo ""
+              echo "<details>"
+              echo "<summary><strong>Semgrep SAST</strong></summary>"
+              echo ""
+              if [ -f "./scan-results/semgrep.json" ]; then
+                rows=$(jq -r '
+                  .results // [] |
+                  map(select(.extra.severity == "ERROR" or .extra.severity == "WARNING")) |
+                  sort_by(.extra.severity, .path, .start.line) |
+                  .[] |
+                  [
+                    ("[" + (.check_id | split(".") | last) + "](https://semgrep.dev/r/" + .check_id + ")"),
+                    .path,
+                    (.start.line | tostring),
+                    .extra.severity,
+                    (.extra.message | gsub("[\n\r\t]"; " ") | .[0:300])
+                  ] |
+                  @tsv
+                ' ./scan-results/semgrep.json 2>/dev/null || echo "")
+                if [ -n "$rows" ]; then
+                  echo "| Rule | Location | Severity | Message |"
+                  echo "|------|----------|----------|---------|"
+                  while IFS=$'\t' read -r rule file line severity message; do
+                    echo "| $rule | \`$file:$line\` | $severity | $message |"
+                  done <<< "$rows"
+                  echo ""
+                else
+                  echo "Could not parse detailed results — refer to the [action logs]($LOGS_URL) for the flagged patterns and file locations."
+                  echo ""
+                fi
+              else
+                echo "Could not parse detailed results — refer to the [action logs]($LOGS_URL) for the flagged patterns and file locations."
+                echo ""
+              fi
+              echo "</details>"
+              echo ""
+            fi
+
+            if [[ "${{ inputs.SUPERVISORD }}" == "true" ]]; then
+              trivy_names=("init" "php" "supervisord")
+              trivy_labels=("Trivy (init image)" "Trivy (php image)" "Trivy (supervisord image)")
+              trivy_outcomes=("$init_outcome" "$php_outcome" "$supervisord_outcome")
+            else
+              trivy_names=("init" "php")
+              trivy_labels=("Trivy (init image)" "Trivy (php image)")
+              trivy_outcomes=("$init_outcome" "$php_outcome")
+            fi
+            for j in "${!trivy_names[@]}"; do
+              name="${trivy_names[$j]}"
+              label="${trivy_labels[$j]}"
+              t_outcome="${trivy_outcomes[$j]}"
+              if [ "$t_outcome" = "failure" ] || [ "$t_outcome" = "skipped" ]; then
+                echo ""
+                echo "<details>"
+                echo "<summary><strong>$label</strong></summary>"
+                echo ""
+                if [ "$t_outcome" = "skipped" ]; then
+                  echo "The Trivy scan was skipped, likely because the Docker image build failed. Refer to the [action logs]($LOGS_URL) for details."
+                  echo ""
+                else
+                  echo "These may contain OS-level package vulnerabilities that require updates (e.g. \`apt update <package>\`) to be added to the Dockerfile."
+                  echo ""
+                  trivy_text=$(cat "./trivy-results-${name}/trivy-${name}.txt" 2>/dev/null || echo "")
+                  if [ -n "$trivy_text" ]; then
+                    trivy_lines=$(echo "$trivy_text" | wc -l)
+                    echo '```'
+                    echo "$trivy_text" | head -150 || true
+                    if [ "$trivy_lines" -gt 150 ]; then
+                      echo "... $((trivy_lines - 150)) more lines — refer to the [action logs]($LOGS_URL) for the full output."
+                    fi
+                    echo '```'
+                    echo ""
+                  fi
+                fi
+                echo "</details>"
+                echo ""
+              fi
+            done
+          fi
+
+        } > /tmp/pr-comment.md
+
+        # GitHub's comment body limit is 65536 chars — hard-truncate if still over
+        if [ "$(wc -c < /tmp/pr-comment.md)" -gt 65000 ]; then
+          { head -c 64800 /tmp/pr-comment.md; printf '\n\n---\n_Output truncated — [refer to action logs](%s) for full results._\n' "$LOGS_URL"; } > /tmp/pr-comment-truncated.md
+          mv /tmp/pr-comment-truncated.md /tmp/pr-comment.md
+        fi
+
+        PR_NUMBER=${{ github.event.pull_request.number }}
+        REPO=${{ github.repository }}
+        MARKER="<!-- vulnerability-scan-results-${{ inputs.REF }} -->"
+
+        comment_id=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+          --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$MARKER\")))] | last | .id // empty")
+
+        if [ -n "$comment_id" ]; then
+          gh api "repos/$REPO/issues/comments/$comment_id" --method PATCH --field body=@/tmp/pr-comment.md
+        else
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/pr-comment.md
+        fi

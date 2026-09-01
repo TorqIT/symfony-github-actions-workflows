@@ -9,9 +9,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  meta:
+    name: "Meta CI checks on workflows repo"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Lint files
+        uses: ./.github/actions/lint
+
   skeleton:
     name: "Meta CI for skeleton"
     uses: ./.github/workflows/ci-docker.yml
     with:
       PROJECT_REPOSITORY: Torq-North/symfony-skeleton
       PROJECT_REPOSITORY_REF: main
+      POST_SCAN_RESULTS_TO_PR: true
