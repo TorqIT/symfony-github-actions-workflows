@@ -196,7 +196,7 @@ jobs:
 
     steps:
       - name: Deactivate Container App revisions
-        uses: azure/cli@v2
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
           inlineScript: |
             set -e
@@ -322,7 +322,7 @@ jobs:
 
     steps:
       - name: Restart PHP Container App latest deactivated revision
-        uses: azure/cli@v2
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
         with:
           inlineScript: |
             set -e
@@ -391,14 +391,14 @@ jobs:
     steps:
       - name: Get workflow version
         id: workflow-version
-        uses: canonical/get-workflow-version-action@v1
+        uses: canonical/get-workflow-version-action@ba22d0abdc1eda539aa3ac81af1cfee160b10714 # v1.0.4
         with:
           repository-name: Torq-North/symfony-github-actions-workflows
           file-name: job-azure-sync.yml
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout workflow repository to use composite actions
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Torq-North/symfony-github-actions-workflows
           ref: ${{ steps.workflow-version.outputs.sha }}
